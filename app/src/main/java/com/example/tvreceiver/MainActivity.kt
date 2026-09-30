@@ -16,9 +16,14 @@ import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
 import androidx.media3.common.C
 import androidx.media3.common.MediaItem
+import androidx.media3.common.MediaMetadata
 import androidx.media3.common.PlaybackParameters
+import androidx.media3.common.Player
+import androidx.media3.datasource.DefaultHttpDataSource
 import androidx.media3.exoplayer.ExoPlayer
+import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
 import androidx.media3.ui.PlayerView
+import org.json.JSONObject
 import java.util.Locale
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
@@ -29,12 +34,16 @@ class MainActivity : AppCompatActivity() {
     private lateinit var statusText: TextView
     private lateinit var progressText: TextView
     private lateinit var fullscreenButton: Button
+    private lateinit var updateButton: Button
     private lateinit var playerView: PlayerView
     private lateinit var player: ExoPlayer
     private lateinit var castServer: CastServer
     private lateinit var servicePublisher: ServicePublisher
+    private lateinit var updateManager: UpdateManager
 
     private var isFullscreen = false
+    @Volatile private var castState = "idle"
+    @Volatile private var castError: String? = null
 
     private val shortSeekMs = 10_000L
     private val longSeekStepMs = 2_000L
@@ -82,6 +91,7 @@ class MainActivity : AppCompatActivity() {
         statusText = findViewById(R.id.statusText)
         progressText = findViewById(R.id.progressText)
         fullscreenButton = findViewById(R.id.fullscreenButton)
+        updateButton = findViewById(R.id.updateButton)
         playerView = findViewById(R.id.playerView)
 
         applyBlackSystemBars()
@@ -90,15 +100,46 @@ class MainActivity : AppCompatActivity() {
         playerView.player = player
         playerView.setShutterBackgroundColor(Color.BLACK)
         playerView.setBackgroundColor(Color.BLACK)
+        player.addListener(object : Player.Listener {
+            override fun onPlaybackStateChanged(playbackState: Int) {
+                castState = when (playbackState) {
+                    Player.STATE_BUFFERING -> "preparing"
+                    Player.STATE_READY -> if (player.isPlaying) "playing" else "paused"
+                    Player.STATE_ENDED -> "ended"
+                    else -> castState
+                }
+            }
+
+            override fun onIsPlayingChanged(isPlaying: Boolean) {
+                if (castState != "ended") castState = if (isPlaying) "playing" else "paused"
+            }
+
+            override fun onPlayerError(error: androidx.media3.common.PlaybackException) {
+                castState = "error"
+                castError = error.message ?: error.errorCodeName
+                statusText.text = "播放失败: ${castError}"
+            }
+        })
         fullscreenButton.setOnClickListener { toggleFullscreen() }
+        updateManager = UpdateManager(this)
+        updateManager.register()
+        updateButton.setOnClickListener { checkForUpdates(manual = true) }
 
         servicePublisher = ServicePublisher(this)
         castServer = CastServer(
-            onUrlReceived = { url ->
+            onUrlReceived = { request ->
                 runOnUiThread {
-                    statusText.text = "收到视频链接: $url"
-                    playUrl(url)
+                    castState = "preparing"
+                    castError = null
+                    statusText.text = "收到视频链接: ${request.title ?: request.url}"
+                    playUrl(request)
                 }
+            },
+            statusProvider = {
+                JSONObject().apply {
+                    put("state", castState)
+                    castError?.let { put("error", it) }
+                }.toString()
             },
             onControlAction = { action ->
                 val latch = CountDownLatch(1)
@@ -133,8 +174,10 @@ class MainActivity : AppCompatActivity() {
             serverStarted -> startupErrors.joinToString(" | ", prefix = "部分功能异常: ")
             else -> startupErrors.joinToString(" | ", prefix = "启动异常: ")
         }
+        updateButton.text = "检查更新"
         updateProgressText()
         uiHandler.post(progressTicker)
+        checkForUpdates(manual = false)
     }
 
     override fun dispatchKeyEvent(event: KeyEvent): Boolean {
@@ -216,6 +259,7 @@ class MainActivity : AppCompatActivity() {
             statusText.visibility = View.GONE
             progressText.visibility = View.GONE
             fullscreenButton.visibility = View.GONE
+            updateButton.visibility = View.GONE
             rootLayout.setPadding(0, 0, 0, 0)
         } else {
             WindowCompat.setDecorFitsSystemWindows(window, true)
@@ -223,10 +267,75 @@ class MainActivity : AppCompatActivity() {
             statusText.visibility = View.VISIBLE
             progressText.visibility = View.VISIBLE
             fullscreenButton.visibility = View.VISIBLE
+            updateButton.visibility = View.VISIBLE
             val dp24 = (24 * resources.displayMetrics.density).toInt()
             rootLayout.setPadding(dp24, dp24, dp24, dp24)
         }
         applyBlackSystemBars()
+    }
+
+    private fun checkForUpdates(manual: Boolean) {
+        updateButton.isEnabled = false
+        updateButton.text = "检查中..."
+        Thread {
+            val release = updateManager.fetchLatestRelease()
+            runOnUiThread {
+                updateButton.isEnabled = true
+                when {
+                    release == null -> {
+                        updateButton.text = "检查更新"
+                        if (manual) {
+                            Toast.makeText(this, "未获取到 GitHub 新版本", Toast.LENGTH_SHORT).show()
+                        }
+                    }
+
+                    updateManager.isNewerThanCurrent(release) -> {
+                        updateButton.text = "更新到 ${release.versionName}"
+                        if (!isFinishing && !isDestroyed) {
+                            showUpdateDialog(release, manual)
+                        }
+                    }
+
+                    else -> {
+                        updateButton.text = "已是最新版本"
+                        if (manual) {
+                            Toast.makeText(
+                                this,
+                                "当前已是最新版本 ${updateManager.currentVersionName()}",
+                                Toast.LENGTH_SHORT
+                            ).show()
+                        }
+                    }
+                }
+            }
+        }.start()
+    }
+
+    private fun showUpdateDialog(release: UpdateManager.ReleaseInfo, manual: Boolean) {
+        val message = buildString {
+            append("发现新版本：")
+            append(release.versionName)
+            append("\n当前版本：")
+            append(updateManager.currentVersionName())
+            if (release.notes.isNotBlank()) {
+                append("\n\n更新说明：\n")
+                append(release.notes.take(600))
+            }
+        }
+        AlertDialog.Builder(this)
+            .setTitle("发现新版本")
+            .setMessage(message)
+            .setPositiveButton("下载安装") { _, _ ->
+                val ok = updateManager.startUpdateDownload(release)
+                updateButton.text = if (ok) "下载中..." else "检查更新"
+                Toast.makeText(
+                    this,
+                    if (ok) "开始下载更新包" else "无法启动下载器",
+                    Toast.LENGTH_SHORT
+                ).show()
+            }
+            .setNegativeButton(if (manual) "取消" else "稍后", null)
+            .show()
     }
 
     private fun handleSeekKeyDown(isForward: Boolean, repeatCount: Int) {
@@ -256,8 +365,17 @@ class MainActivity : AppCompatActivity() {
         uiHandler.removeCallbacks(longSeekTicker)
     }
 
-    private fun playUrl(url: String) {
-        player.setMediaItem(MediaItem.fromUri(url))
+    private fun playUrl(request: CastMediaRequest) {
+        val dataSourceFactory = DefaultHttpDataSource.Factory()
+            .setAllowCrossProtocolRedirects(true)
+            .setDefaultRequestProperties(request.headers)
+        val mediaSourceFactory = DefaultMediaSourceFactory(dataSourceFactory)
+        val mediaItemBuilder = MediaItem.Builder().setUri(request.url)
+        request.mimeType?.takeIf { it.isNotBlank() }?.let { mediaItemBuilder.setMimeType(it) }
+        request.title?.takeIf { it.isNotBlank() }?.let {
+            mediaItemBuilder.setMediaMetadata(MediaMetadata.Builder().setTitle(it).build())
+        }
+        player.setMediaSource(mediaSourceFactory.createMediaSource(mediaItemBuilder.build()))
         player.prepare()
         player.playWhenReady = true
         updateStatus("开始播放")
@@ -391,6 +509,7 @@ class MainActivity : AppCompatActivity() {
         super.onDestroy()
         stopLongSeek()
         uiHandler.removeCallbacks(progressTicker)
+        updateManager.unregister()
         servicePublisher.unregister()
         castServer.stop()
         player.release()

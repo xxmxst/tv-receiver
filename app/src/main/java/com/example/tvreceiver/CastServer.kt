@@ -4,7 +4,8 @@ import fi.iki.elonen.NanoHTTPD
 import org.json.JSONObject
 
 class CastServer(
-    private val onUrlReceived: (String) -> Unit,
+    private val onUrlReceived: (CastMediaRequest) -> Unit,
+    private val statusProvider: () -> String = { "{\"state\":\"idle\"}" },
     private val onControlAction: (String) -> Pair<Boolean, String>
 ) : NanoHTTPD(PORT) {
 
@@ -12,6 +13,10 @@ class CastServer(
         return when {
             session.method == Method.GET && session.uri == "/health" -> {
                 newFixedLengthResponse(Response.Status.OK, "text/plain", "ok")
+            }
+
+            session.method == Method.GET && session.uri == "/status" -> {
+                newFixedLengthResponse(Response.Status.OK, "application/json", statusProvider())
             }
 
             session.method == Method.POST && session.uri == "/cast" -> {
@@ -24,7 +29,21 @@ class CastServer(
                     if (url.isBlank()) {
                         newFixedLengthResponse(Response.Status.BAD_REQUEST, "text/plain", "missing url")
                     } else {
-                        onUrlReceived(url)
+                        val headers = linkedMapOf<String, String>()
+                        json.optJSONObject("headers")?.let { objectValue ->
+                            objectValue.keys().forEach { key ->
+                                val value = objectValue.optString(key).trim()
+                                if (value.isNotBlank() && key.length <= 80) headers[key] = value
+                            }
+                        }
+                        onUrlReceived(
+                            CastMediaRequest(
+                                url = url,
+                                mimeType = json.optString("mimeType").takeIf { it.isNotBlank() },
+                                title = json.optString("title").takeIf { it.isNotBlank() },
+                                headers = headers
+                            )
+                        )
                         newFixedLengthResponse(Response.Status.OK, "text/plain", "received")
                     }
                 } catch (e: Exception) {
